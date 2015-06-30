@@ -15,7 +15,7 @@ setup(
     ],
     install_requires=[
         'tornado',
-        'boto',
+        'boto3',
         'ipython'
     ],
     zip_safe=False
