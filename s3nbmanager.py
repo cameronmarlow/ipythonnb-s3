@@ -1,85 +1,155 @@
 import datetime
+import json
 
 from tornado import web
 
 import boto3
 
-from IPython.html.services.notebooks.nbmanager import NotebookManager
-from IPython.nbformat import current
+from IPython.html.services.contents.manager import ContentsManager
+import  IPython.nbformat
 from IPython.utils.traitlets import Unicode
 
-class S3NotebookManager(NotebookManager):
+class S3ContentsManager(ContentsManager):
 
-    aws_access_key_id = Unicode(config=True, help='AWS access key id.')
-    aws_secret_access_key = Unicode(config=True, help='AWS secret access key.')
-    s3_bucket = Unicode('', config=True, help='Bucket name for notebooks.')
-    s3_prefix = Unicode('', config=True, help='Key prefix of notebook location')
+    s3_bucket = Unicode('', config=True, help='Bucket name for contents.')
+    s3_prefix = Unicode('', config=True, help='Key prefix for contents')
 
     def __init__(self, **kwargs):
-        super(S3NotebookManager, self).__init__(**kwargs)
-        # Configuration of aws access keys default to '' since it's unicode.
-        # boto will fail if empty strings are passed therefore convert to None
-        access_key = self.aws_access_key_id if self.aws_access_key_id else None
-        secret_key = self.aws_secret_access_key if self.aws_secret_access_key else None
-        self.s3_con = boto3.connect_s3(access_key, secret_key)
-        self.bucket = self.s3_con.get_bucket(self.s3_bucket)
-
-    def load_notebook_names(self):
+        super(S3ContentsManager, self).__init__(**kwargs)
+        # Configuration of aws access keys should be handled with awscli with
+        # boto3, e.g. 'aws configure'
+        self.s3 = boto3.resource('s3')
+        self.bucket = self.s3.Bucket(self.s3_bucket)
         self.mapping = {}
-        keys = self.bucket.list(self.s3_prefix)
-        ids = [k.name[len(self.s3_prefix):] for k in keys]
 
-        for id in ids:
-            name = self.bucket.get_key(self.s3_prefix + id).get_metadata('nbname')
-            self.mapping[id] = name
+    def is_hidden(self, path):
+        """S3 does not support hidden files"""
+        return False
 
-    def list_notebooks(self):
-        data = [dict(notebook_id=id,name=name) for id, name in self.mapping.items()]
-        data = sorted(data, key=lambda item: item['name'])
-        return data
+    def file_exists(self, path):
+        """Returns True if the file exists, else returns False."""
+        key = self.s3_prefix + path
+        objs = list(self.bucket.objects.filter(Prefix=key).limit(1))
+        if len(objs) > 0:
+            return objs[0].key == key
+        else:
+            return False
 
-    def read_notebook_object(self, notebook_id):
-        if not self.notebook_exists(notebook_id):
-            raise web.HTTPError(404, u'Notebook does not exist: %s' % notebook_id)
-        try:
-            key = self.bucket.get_key(self.s3_prefix + notebook_id)
-            s = key.get_contents_as_string()
-        except:
-            raise web.HTTPError(500, u'Notebook cannot be read.')
+    def dir_exists(self, path):
+        """Returns True if key prefix exists"""
+        key = self.s3_prefix + path
+        if key.endswith('/'):
+            # true if key ends in '/' and subkeys exist
+            objs = list(self.bucket.objects.filter(Prefix=key))
+            print(path, key, objs, len(objs) > 0)
+            return len(objs) > 0
+        else:
+            return False
 
-        try:
-            # v1 and v2 and json in the .ipynb files.
-            nb = current.reads(s, u'json')
-        except:
-            raise web.HTTPError(500, u'Unreadable JSON notebook.')
-        # Todo: The last modified should actually be saved in the notebook document.
-        # We are just using the current datetime until that is implemented.
-        last_modified = datetime.datetime.utcnow()
-        return last_modified, nb
+    def exists(self, path):
+        """Check for file or directory existence"""
+        if path.endswith('/'):
+            return self.dir_exists(path)
+        else:
+            return self.file_exists(path)
 
-    def write_notebook_object(self, nb, notebook_id=None):
-        try:
-            new_name = nb.metadata.name
-        except AttributeError:
-            raise web.HTTPError(400, u'Missing notebook name')
+    def _base_model(self, path):
+        """Build the common base of a contents model"""
+        key = self.s3_prefix + path
+        objs = list(self.bucket.objects.filter(Prefix=key).limit(1))
+        if objs:
+            # TODO: figure out a more elegant solution for last-modified for
+            # folders
+            last_modified = objs[0].last_modified
+            model = {}
+            model['bucket'] = self.s3_bucket
+            model['key'] = key
+            model['name'] = path.rsplit('/', 1)[-1]
+            model['path'] = path
+            model['last_modified'] = last_modified
+            model['created'] = last_modified
+            model['content'] = None
+            model['format'] = None
+            model['mimetype'] = None
+            return model
 
-        if notebook_id is None:
-            notebook_id = self.new_notebook_id(new_name)
+    def _write_file(self, path, content):
+        key = self.s3_prefix + path
+        self.s3.Object(self.s3_bucket, key).put(Body=content)
 
-        try:
-            data = current.writes(nb, u'json')
-        except Exception as e:
-            raise web.HTTPError(400, u'Unexpected error while saving notebook: %s' % e)
+    def _read_file(self, path):
+        key = self.s3_prefix + path
+        obj = self.s3.Object(self.s3_buckt, key).get()
+        return obj['Body'].read()
 
-        try:
-            key = self.bucket.new_key(self.s3_prefix + notebook_id)
-            key.set_metadata('nbname', new_name)
-            key.set_contents_from_string(data)
-        except Exception as e:
-            raise web.HTTPError(400, u'Unexpected error while saving notebook: %s' % e)
+    def _file_model(self, path, content=True):
+        """Build a model for a file"""
+        model = self._base_model(path)
+        model['type'] = 'file'
 
-        self.mapping[notebook_id] = new_name
-        return notebook_id
+        if content:
+            model['content'] = self._read_file(path)
+
+        return model
+
+    def _notebook_model(self, path, content=True):
+        """Build a notebook model
+
+        if content is requested, the notebook content will be populated
+        as a JSON structure (not double-serialized)
+        """
+        model = self._base_model(path)
+        model['type'] = 'notebook'
+        if content:
+            contents = self._read_file(path)
+            notebook = nbformat.read(contents, as_version=4)
+            self.mark_trusted_cells(notebook, path)
+            model['content'] = notebook
+            model['format'] = 'json'
+            self.validate_notebook_model(model)
+        return model
+
+    def _dir_model(self, path, content=True):
+        """Build a model for a directory"""
+        model = self._base_model(path)
+        model['type'] = 'directory'
+        if content:
+            key = self.s3_prefix + path
+            objects = list(self.bucket.objects.filter(Prefix=key))
+            model['contents'] = \
+                [self.get(obj.key, content=False) for obj in objects]
+            model['format'] = 'json'
+            print(path, key, model['contents'])
+        return model
+
+    def get(self, path, content=True, type=None, format=None):
+
+        if not self.exists(path):
+            raise web.HTTPError(404, u'No such file or directory: %s' % path)
+
+        if path.endswith('/') or path == "":
+            if type not in (None, 'directory'):
+                raise web.HTTPError(400,
+                    u'%s is a directory, not a %s' % (path, type),
+                    reason='bad type')
+            model = self._dir_model(path, content=content)
+            print(model)
+        elif type == 'notebook' or (type is None and path.endswith('.ipynb')):
+            model = self._notebook_model(path, content=content)
+        else:
+            if type == 'directory':
+                raise web.HTTPError(400,
+                                u'%s is not a directory' % path, reason='bad type')
+            model = self._file_model(path, content=content, format=format)
+        return model
+
+    def delete(self, path):
+        """Remove notebook from S3 Bucket"""
+        obj = self.bucket.Object(self.s3_prefix + path)
+
+    def copy(self, from_path, to_path=None):
+        pass
 
     def info_string(self):
+        """Description of S3 Notebook Manager"""
         return "Serving notebooks from s3. bucket name: %s" % self.s3_bucket

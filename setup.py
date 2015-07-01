@@ -7,7 +7,7 @@ setup(
     version='0.0.1',
     description='IPython notebook manager which saves to S3',
     py_modules=['s3nbmanager'],
-    url='https://github.com/davidbrai/ipythonnb-s3',
+    url='https://github.com/cameronmarlow/ipythonnb-s3',
     classifiers=[
         'Programming Language :: Python',
         'Topic :: Internet :: API',
